@@ -1,299 +1,60 @@
-# synx
+# duet
 
-> Fast, real-time two-way file sync over SSH. One command, no daemons — a simpler Mutagen alternative, written in Rust.
+> Real-time two-way file sync. A performance by two.
 
-[![CI](https://github.com/muvon/synx/actions/workflows/ci.yml/badge.svg)](https://github.com/muvon/synx/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FMuvon%2Fsynx%2Fbadges%2Fcoverage.json&style=flat-square)](https://github.com/Muvon/synx/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+Forked from [Muvon/synx](https://github.com/Muvon/synx) (Rust), rebuilt **Bun-forward** in TypeScript for the sovereign estate.
 
-**Contents:** [Why synx](#why-synx) · [Install](#install) · [Quick start](#quick-start) · [Sync modes](#sync-modes) · [Ignore rules](#ignore-rules--authoritative) · [How it works](#how-it-works) · [Troubleshooting](#troubleshooting) · [Limits](#limits--future-work)
+## Why duet
 
-```
-synx  /Users/dk/proj  ◀─▶  dev@beefy:/srv/proj
-✓ connected
-• manifests:  local 1243  •  remote 1180 (47 ignored)
-• plan: push 78 files (4.2 MiB) 6 dirs 0 links  •  pull 14 entries
-✓ initial sync: 4.2 MiB sent, 312 KiB received in 1.4s
-• watching for changes — ctrl+c to stop
-  → src/main.rs  3.1 KiB
-  ← README.md   824 B
-```
+- **Event-driven, never polling** (for local changes): `fs.watch` with 200ms debounce coalesces editor save storms. No timers.
+- **μ-speed transfers**: batched tar+base64, chunks upload in parallel via `yote-conn multi`, zero-padded for correct reassembly.
+- **Failover**: append-only JSONL queue, fsync'd before ack. Bridge down? Changes queue locally, replay on reconnect. Never lose writes.
+- **Conflict resolution**: three-way diff vs baseline, last-write-wins by mtime, ties flagged for review. Dirty WIP preserved.
+- **Atomic writes**: tmp+rename, never partial files (synx pattern).
 
-## Why synx
-
-- **One command, no daemons.** `synx ./here you@there:/path` — that's it. No
-  config files, no session manager, no agents to register.
-- **Respects `.gitignore` everywhere.** Nested `.gitignore` files at any depth
-  are loaded and applied authoritatively — files that match are *never* synced,
-  in either direction.
-- **Real-time, both ways.** A debounced filesystem watcher on each side ships
-  changes the moment they happen. Push, pull, or two-way (default).
-- **Production-grade transfer.** Parallel hashing (blake3 + multi-threaded
-  walk), persistent hash cache (re-runs skip re-hashing unchanged files),
-  rsync-style delta sync for large mutable files, zstd compression on the wire,
-  atomic file writes, chunked transfer for large files.
-- **Just SSH.** Uses your existing `ssh` setup — keys, agents, `~/.ssh/config`,
-  `ProxyJump`, `ControlMaster`. No new auth to manage.
-- **Git-aware.** Pauses `.git/` synchronization when it detects an active git
-  operation (rebase, merge, cherry-pick, etc.) so you never corrupt a repo
-  mid-operation.
-- **Wrong-repo protection.** If both sync roots are git repositories, their
-  remotes are compared at connect time — syncing two different projects over
-  one path is refused (`--allow-repo-mismatch` overrides).
-- **macOS + Linux.** FSEvents on macOS, inotify on Linux, via the `notify`
-  crate.
-
-## Install
-
-```sh
-# one-liner (Linux & macOS, x86_64 + ARM64)
-curl -fsSL https://raw.githubusercontent.com/Muvon/synx/master/install.sh | sh
-
-# from source
-git clone https://github.com/Muvon/synx.git && cd synx
-cargo install --path .
-```
-
-You need synx **on both ends**: your local machine *and* the remote. The
-quickest way is to run the one-liner on each host. If you already have a
-local release build:
-
-```sh
-scp target/release/synx user@host:~/.local/bin/synx
-ssh user@host 'chmod +x ~/.local/bin/synx'
-```
-
-## Quick start
-
-```sh
-# two-way sync (default)
-synx ./src dev@host:/srv/app/src
-
-# one-way push (local → remote)
-synx ./build host:/var/www --mode push
-
-# one-way pull (remote → local)
-synx ./nginx host:/etc/nginx --mode pull
-
-# do the initial sync and exit (no live watch)
-synx ./code host:/work --once
-
-# show what would happen, do nothing
-synx ./code host:/work --dry-run
-
-# verbose logging
-synx ./code host:/work -v        # debug
-synx ./code host:/work -vv       # trace
-
-# SSH on a non-standard port
-synx ./code host:/work --ssh-opts "-p 2222"
-
-# synx isn't in PATH on the remote
-synx ./code host:/work --remote-synx ~/.local/bin/synx
-
-# tilde expansion works
-synx ~/notes host:~/notes
-```
-
-## Sync modes
-
-| Mode | Direction | Conflict | Initial sync |
-|------|-----------|----------|--------------|
-| `push` | local → remote | local always wins | only sends local-only or differing files |
-| `pull` | remote → local | remote always wins | only fetches remote-only or differing files |
-| `both` (default) | bidirectional | **newer mtime wins** | merges (no deletions on first sync) |
-
-In `both` mode, **deletions only propagate during live watch** — the initial
-sync never deletes files, so accidentally running `synx` against a stale path
-won't blow away your data. If a file vanishes while synx is watching, the
-deletion is propagated.
-
-## Ignore rules — authoritative
-
-synx loads **every `.gitignore`** under your sync root (plus an optional
-`.synxignore` with identical syntax) and treats them as the single source of
-truth for what *isn't* synced. This applies to:
-
-1. **The initial walk** — ignored files never enter the manifest.
-2. **The remote manifest** — files reported by the remote that match your
-   local `.gitignore` are filtered out *before* the diff plan, so you don't
-   accidentally pull a `target/` or `node_modules/` that the remote happened
-   to have.
-3. **Live events** — both incoming applies and outgoing notifications skip
-   ignored paths.
-
-**Dotfiles are NOT special.** `.env`, `.git/`, `.vscode/`, etc. are synced
-just like any other path unless your `.gitignore` (or `.synxignore`) excludes
-them. If you don't want to sync `.git/`, add a line to `.synxignore`:
-
-```sh
-echo '/.git' >> .synxignore
-```
-
-If you change a `.gitignore` mid-session, restart synx to pick up the new
-rules.
-
-## How it works
+## Architecture (borrowed from synx)
 
 ```
-┌─ local (client) ──────────────┐         ┌─ remote (agent) ─────────────┐
-│                               │   ssh   │                              │
-│  watcher (notify) ──┐         │ ◀─────▶ │  watcher (notify) ──┐        │
-│  walker (parallel)  │         │  stdio  │  walker (parallel)  │        │
-│  hash cache         │         │ postcard│  hash cache         │        │
-│                     ▼         │ + zstd  │                     ▼        │
-│  ┌─────────────────────┐      │         │  ┌────────────────────┐      │
-│  │ diff plan + executor│ ◀────┼─────────┼─▶│ message dispatcher │      │
-│  └─────────────────────┘      │         │  └────────────────────┘      │
-└───────────────────────────────┘         └──────────────────────────────┘
+cell (~/workspace/skills)                    yote (/home/toxic/sovereign/skills)
+┌─────────────────────┐                      ┌─────────────────────┐
+│ cell.ts             │                      │ yote.ts             │
+│ ├─ fs.watch (event) │──pushBatch──────────▶│ ├─ fs.watch (event) │
+│ ├─ manifest poll    │◀──/tmp/duet-manifest─│ └─ manifest writer  │
+│ └─ failover queue   │   (10s, single JSON) │                     │
+└─────────────────────┘                      └─────────────────────┘
+         │ transport.ts: yote-conn exec, parallel chunk upload
 ```
 
-- The client spawns `ssh user@host -- synx --agent /remote/path`. The same
-  binary runs on both sides; agent mode is hidden from `--help`.
-- Both sides walk their tree **once in parallel** with
-  `ignore::WalkBuilder::build_parallel()`, discovering nested ignore files and
-  hashing files with **blake3** in the same pass. Cache hits are immutable
-  lookups and walker results are batched per worker, so parallel traversal has
-  no global per-file lock. A persistent cache keyed on `(path, size, mtime)` in
-  `~/.cache/synx/` means re-runs skip rehashing unchanged files, and unchanged
-  cache/baseline state is not rewritten to disk.
-- Manifests stream over the wire (length-prefixed postcard, optionally zstd
-  level 3 — compressed only when it saves space).
-- The client computes a diff plan filtered through `.gitignore`. Operations
-  are: dirs first → symlinks → files, then `FileGet` requests for pulls,
-  then `SyncDone`.
-- **Delta sync.** Files between 256 KiB and 256 MiB where the remote already
-  has a different version are synced via rsync-style deltas (`fast_rsync`,
-  SIMD-accelerated librsync). The receiver requests a signature of its
-  current copy, the sender computes a delta against it, and the result is
-  verified with blake3 before accepting — fast_rsync uses MD4 internally,
-  so the blake3 check is the only honest integrity guarantee. Files outside
-  the delta band fall back to full transfer.
-- Files larger than **16 MiB** are streamed in **4 MiB chunks** to a temp
-  file, then atomically renamed (`rename(2)`) into place with original mode
-  and mtime preserved.
-- **Three-way deletion diff.** A persistent baseline manifest records what
-  both sides agreed on at the last successful sync. Without it, "the user
-  deleted this file here" and "the peer created this file there" are
-  indistinguishable — a stateless diff would silently resurrect deletions.
-  The baseline lets synx classify a missing path as a genuine deletion
-  (propagate) or a concurrent change (keep, never lose data).
-- **Git gate.** When synx detects an active git operation (rebase, merge,
-  cherry-pick, revert, bisect, or a live `index.lock` / `HEAD.lock`), it
-  pauses `.git/` synchronization and queues `.git/` events until the
-  operation finishes. Stale markers older than 10 minutes are ignored, so
-  a crashed git self-heals.
-- Live mode runs both sides simultaneously. A 200ms debounce on the watcher
-  coalesces editor save-storms and macOS FSEvent batching. Per-path event
-  coalescing inside each batch ensures `Create+Modify` (typical editor save)
-  becomes a single push, not two.
-- **Echo suppression is state-based, not time-based.** When we apply an
-  incoming change, we record the resulting mtime (or "deleted"). When our
-  watcher subsequently fires for that path, we compare the **current** on-disk
-  mtime to what we recorded — only a *matching* state is treated as an echo
-  and dropped. If the user has modified the file in the meantime, the event
-  flows through normally. This means there's no time window during which
-  legitimate user edits are blocked.
-- The receiver also does **content dedup**: if an incoming `FileData` matches
-  what's already on disk (same size + mtime), the apply is skipped entirely.
-  Wasted bandwidth on the wire, but no on-disk churn and no log spam.
-- SSH uses `ControlMaster auto` with a 60-second persist, so multiple synx
-  invocations reuse the same TCP connection.
+Modules:
+- `hasher.ts` — Bun.hash content cache (skip re-hashing unchanged files)
+- `watcher.ts` — debounced fs.watch (200ms, synx's DEBOUNCE)
+- `queue.ts` — failover queue (append-only JSONL, coalesce, replay)
+- `sync.ts` — manifest build, three-way planSync, defaultIgnore
+- `transport.ts` — yote-conn exec, pushBatch (parallel), pullBatch, fetchManifest
+- `cell.ts` — cell daemon (watch + push, poll manifest + pull)
+- `yote.ts` — yote daemon (watch + manifest writer)
 
-## Performance notes
+## Usage
 
-- **First sync of a large repo** is bound by hash + transfer. blake3 hashes at
-  multi-GB/s on modern hardware, and the parallel walker uses all your cores.
-- **Re-sync of an unchanged repo** costs only the walk — the hash cache hit
-  rate is ~100%, so nothing is re-hashed.
-- **Live mode** has sub-second latency from save to remote write. Most of the
-  time is the 200ms debounce.
-- **Delta sync** cuts wire traffic on large mutable files (logs, dumps,
-  binaries that change slightly) — only the changed blocks are sent.
-- **Compression** is on by default (zstd level 3). For local-network sync of
-  binary blobs that don't compress, `--no-compress` is faster. Common formats
-  that are already compressed (archives, media, packages) automatically bypass
-  zstd so they don't spend CPU proving they cannot shrink.
+```bash
+# cell daemon (systemd or nohup)
+bun src/cell.ts
 
-## Troubleshooting
+# yote daemon (systemd user unit: duet-yote.service)
+bun src/yote.ts
 
-**"synx: command not found"** on the remote side.
-The agent must be in `$PATH` of the remote login shell. Either install it
-there (one-liner above) or pass `--remote-synx /full/path/to/synx`.
+# one-shot sync and exit
+bun src/cell.ts --once
 
-**Protocol mismatch.**
-`synx 0.1` is wire-incompatible with future versions. Upgrade both sides.
-
-**"refusing to sync: different git repositories".**
-Both roots are git repos but track different remotes, so synx refuses to
-merge them. Point the remote path at the right directory, or pass
-`--allow-repo-mismatch` if the mismatch is intentional (e.g. a fork and
-its upstream).
-
-**"Permission denied" on initial sync.**
-If the denied path is inside the sync root, synx prints a warning, skips that
-inaccessible resource, and continues watching and syncing the readable parts of
-the tree. If the sync root itself is denied, verify the remote path permissions.
-For failures before a path is shown, also verify the SSH login with
-`ssh user@host`.
-
-**Files keep getting re-synced.**
-Most often clock skew between local and remote in `both` mode — the side
-with the future clock always "wins". Either set both clocks via NTP or use
-`--mode push` / `--mode pull` explicitly.
-
-**Large file fails to transfer.**
-synx caps per-message size at 64 MiB; for files larger than the chunk
-threshold (16 MiB) it uses streaming chunks of 4 MiB, so there's no
-practical file-size limit. If you hit `message too large`, file a bug — it
-shouldn't be reachable.
-
-**`target/` (or `node_modules/`) is getting synced anyway.**
-If the file already exists on the remote, synx 0.1 will NOT delete it
-during initial sync (the safer two-way behavior). It also won't push or pull
-it from now on (the `.gitignore` filter blocks that). To clean up old
-ignored files on the remote, delete them by hand once.
-
-## Configuration
-
-There's no config file. Everything is CLI flags. Persistent state:
-
-```
-~/.cache/synx/<hash>.cache       # (size,mtime)→blake3 hash, per sync root
-~/.cache/synx/<hash>.baseline    # last converged manifest, per sync root
-~/.ssh/synx-%C                   # SSH ControlMaster sockets
+# status
+bun src/cli.ts status
 ```
 
-## Limits / future work
+## Deployment
 
-- **No three-way content merge.** Conflicts use mtime-wins, not
-  ancestor-aware content merging. Deletions are three-way (baseline-backed),
-  but file content conflicts are not. Reliable as long as both clocks are
-  sane.
-- **No daemon mode.** synx is foreground-only; `&` it or use `tmux`/`screen`
-  for now. Daemonization with `synx status` / `synx stop` is planned.
-- **Hash cache invalidation** is by (size, mtime) only. A file changed in
-  place with the same size and mtime won't be re-hashed. This is the same
-  heuristic git uses and is correct in practice.
-
-## Contributing
-
-```sh
-# clone and build
-git clone https://github.com/Muvon/synx.git
-cd synx
-cargo build --release
-
-# run tests
-cargo test
-
-# run synx locally against a remote
-./target/release/synx ./src user@host:/srv/src -v
-```
-
-CI runs on every push (`.github/workflows/ci.yml`). Releases are built and
-published automatically from tags (`.github/workflows/release.yml`).
+- **yote**: systemd user unit `duet-yote.service` (enabled, restart=always)
+- **cell**: `bun src/cell.ts` via nohup (TODO: proper supervisor)
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0 (inherited from synx)

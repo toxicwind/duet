@@ -1,0 +1,14 @@
+{
+  "name": "@toxicwind/duet",
+  "version": "0.1.0",
+  "description": "Duet — real-time two-way file sync. A performance by two. Forked from Muvon/synx, rebuilt Bun-forward.",
+  "type": "module",
+  "bin": {
+    "duet": "./src/cli.ts"
+  },
+  "scripts": {
+    "cell": "bun src/cell.ts",
+    "yote": "bun src/yote.ts",
+    "test": "bun test"
+  }
+}
