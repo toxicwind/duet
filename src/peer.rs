@@ -198,11 +198,11 @@ pub fn apply_rename(root: &Path, from: &Path, to: &Path) -> Result<()> {
 
 /// Legacy temporary directory used before temporary files moved beside their
 /// destination. Retained only so startup can clean leftovers from old runs.
-fn tmp_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".synx")
-        .join("tmp")
+/// Returns `None` when the home directory is unknown: the legacy location is
+/// defined relative to home, so fabricating a fallback (e.g. under /tmp)
+/// would point cleanup at a directory that was never ours to sweep.
+fn tmp_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".synx").join("tmp"))
 }
 
 /// Allocate beside the destination so rename(2) remains atomic even when the
@@ -413,7 +413,9 @@ impl GitGate {
 /// Cheap; safe to call at startup of both client and agent.
 pub fn cleanup_orphan_tmps() {
     use std::time::{Duration, SystemTime};
-    let dir = tmp_dir();
+    let Some(dir) = tmp_dir() else {
+        return;
+    };
     let Ok(entries) = fs::read_dir(&dir) else {
         return;
     };
@@ -624,9 +626,9 @@ pub fn apply_delta_to_file(
 
 /// Move `tmp` into place at `final_path` and stamp mode + mtime.
 ///
-/// Uses `rename(2)` only — atomic. Tmp lives under `~/.synx/tmp/`, target
-/// lives under the user's sync root; on a normal install both are on the
-/// home filesystem so rename succeeds. If they aren't (target on a
+/// Uses `rename(2)` only — atomic. Tmp lives beside the destination
+/// (`.synx-tmp-<pid>-<nanos>`, see `tmp_path`), so both paths are on the
+/// same filesystem and rename succeeds. If they aren't (target on a
 /// different mount), rename fails with EXDEV and the error propagates —
 /// loud failure rather than a silent non-atomic fallback.
 fn finalize_path(tmp: &Path, final_path: &Path, mode: u32, mtime: i64) -> Result<()> {
