@@ -44,11 +44,20 @@ export async function pushBatch(
   remoteRoot: string,
   relPaths: string[]
 ): Promise<boolean> {
-  if (relPaths.length === 0) return true;
+  // Filter to files that actually exist (skip deleted/missing — they're handled by planSync)
+  const existing = relPaths.filter(p => {
+    try {
+      return existsSync(join(localRoot, p));
+    } catch {
+      return false;
+    }
+  });
+  if (existing.length === 0) return true; // nothing to push (all missing)
+  const relPathsFiltered = existing;
 
   // Build tar in /tmp
   const tarPath = join(tmpdir(), `duet-push-${Date.now()}.tar.gz`);
-  const files = relPaths.map(p => `"${p.replace(/"/g, '\\"')}"`).join(" ");
+  const files = relPathsFiltered.map(p => `"${p.replace(/"/g, '\\"')}"`).join(" ");
 
   try {
     await $`tar -czf ${tarPath} -C ${localRoot} ${{ raw: files }}`.quiet();
