@@ -116,7 +116,7 @@ export async function pushBatch(
     `cat ${YOTE_SCRATCH}/duet-${batchId}-chunk-* | base64 -d > ${YOTE_SCRATCH}/duet-${batchId}.tar.gz`,
     `rm -f ${YOTE_SCRATCH}/duet-${batchId}-chunk-*`,
     `mkdir -p ${remoteRoot}.duet-incoming`,
-    `tar -xzf ${YOTE_SCRATCH}/duet-${batchId}.tar.gz -C ${remoteRoot}.duet-incoming`,
+    `tar --no-same-owner -xzf ${YOTE_SCRATCH}/duet-${batchId}.tar.gz -C ${remoteRoot}.duet-incoming`,
     `cd ${remoteRoot}.duet-incoming && find . -type f -print0 | while IFS= read -r -d '' f; do dest="${remoteRoot}/$f"; mkdir -p "$(dirname "$dest")"; mv "$f" "$dest"; done`,
     `rm -rf ${remoteRoot}.duet-incoming ${YOTE_SCRATCH}/duet-${batchId}.tar.gz`,
     `echo OK`,
@@ -176,7 +176,7 @@ export async function pullBatch(
     writeFileSync(localTmp, tarData);
     // Extract to a temp dir, then read the requested files
     const result = new Map<string, Buffer>();
-    await $`mkdir -p ${extractDir} && tar -xzf ${localTmp} -C ${extractDir}`.quiet();
+    await $`mkdir -p ${extractDir} && tar --no-same-owner -xzf ${localTmp} -C ${extractDir}`.quiet();
     for (const rel of relPaths) {
       const fp = join(extractDir, rel);
       if (existsSync(fp)) {
