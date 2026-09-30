@@ -9,7 +9,8 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
 
 const YOTE_ROOT = "/home/toxic/sovereign/skills";
-const MANIFEST_PATH = "/tmp/duet-manifest.json";
+const YOTE_SCRATCH = "/home/toxic/.duet-scratch";
+const MANIFEST_PATH = `${YOTE_SCRATCH}/duet-manifest.json`;
 const CACHE_PATH = "/home/toxic/.duet/hashcache.json";
 
 function writeManifest(m: Manifest) {
@@ -27,6 +28,7 @@ async function main() {
   const hasher = new HashCache(CACHE_PATH);
 
   console.log(`[duet-yote] root=${YOTE_ROOT}`);
+  mkdirSync(YOTE_SCRATCH, { recursive: true }); // persistent scratch — never /tmp tmpfs
 
   // Initial manifest
   const rebuild = () => {
@@ -50,7 +52,7 @@ async function main() {
     defaultIgnore
   );
   watcher.start();
-  console.log("[duet-yote] watching (event-driven), manifest at /tmp/duet-manifest.json");
+  console.log(`[duet-yote] watching (event-driven), manifest at ${MANIFEST_PATH}`);
 
   process.on("SIGINT", () => { watcher.stop(); hasher.save(); process.exit(0); });
   process.on("SIGTERM", () => { watcher.stop(); hasher.save(); process.exit(0); });

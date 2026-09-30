@@ -3,10 +3,15 @@
 
 import { $ } from "bun";
 import { join } from "path";
-import { tmpdir } from "os";
-import { writeFileSync, readFileSync, existsSync } from "fs";
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
 
 const YOTE_CONN = `${process.env.HOME}/workspace/bin/yote-conn`;
+
+// Persistent scratch — NEVER the cell's 512M /tmp tmpfs (Chris 2026-09-30:
+// duet's retry loop filled tmpfs and broke everything). Same on yote.
+const SCRATCH_DIR = join(process.env.HOME!, ".duet", "scratch");
+mkdirSync(SCRATCH_DIR, { recursive: true });
+const YOTE_SCRATCH = "/home/toxic/.duet-scratch";
 
 export interface ExecResult {
   ok: boolean;
@@ -55,8 +60,8 @@ export async function pushBatch(
   if (existing.length === 0) return true; // nothing to push (all missing)
   const relPathsFiltered = existing;
 
-  // Build tar in /tmp
-  const tarPath = join(tmpdir(), `duet-push-${Date.now()}.tar.gz`);
+  // Build tar in persistent scratch (never /tmp tmpfs)
+  const tarPath = join(SCRATCH_DIR, `duet-push-${Date.now()}.tar.gz`);
   const files = relPathsFiltered.map(p => `"${p.replace(/"/g, '\\"')}"`).join(" ");
 
   try {
@@ -78,10 +83,13 @@ export async function pushBatch(
 
   const batchId = Date.now();
   const pad = String(chunks.length).length;
-  const cmds = chunks.map((c, i) => ({
-    cmd: `printf '%s' '${c}' > /tmp/duet-${batchId}-chunk-${String(i).padStart(pad, "0")}`,
-    tag: `chunk-${i}`,
-  }));
+  const cmds = [
+    { cmd: `mkdir -p ${YOTE_SCRATCH}`, tag: "mkdir" },
+    ...chunks.map((c, i) => ({
+      cmd: `printf '%s' '${c}' > ${YOTE_SCRATCH}/duet-${batchId}-chunk-${String(i).padStart(pad, "0")}`,
+      tag: `chunk-${i}`,
+    })),
+  ];
 
   // Single multi call uploads all chunks in parallel
   const multiProc = Bun.spawn(
@@ -95,22 +103,22 @@ export async function pushBatch(
 
   // Verify all chunks landed
   const verify = await yoteExec(
-    `ls /tmp/duet-${batchId}-chunk-* 2>/dev/null | wc -l`
+    `ls ${YOTE_SCRATCH}/duet-${batchId}-chunk-* 2>/dev/null | wc -l`
   );
   if (!verify.ok || parseInt(verify.stdout.trim()) !== chunks.length) {
-    await yoteExec(`rm -f /tmp/duet-${batchId}-chunk-*`);
+    await yoteExec(`rm -f ${YOTE_SCRATCH}/duet-${batchId}-chunk-*`);
     return false;
   }
 
   // Concatenate, decode, extract atomically — single exec
   // Note: while-loop body uses ; not && (do && is a syntax error)
   const applyCmd = [
-    `cat /tmp/duet-${batchId}-chunk-* | base64 -d > /tmp/duet-${batchId}.tar.gz`,
-    `rm -f /tmp/duet-${batchId}-chunk-*`,
+    `cat ${YOTE_SCRATCH}/duet-${batchId}-chunk-* | base64 -d > ${YOTE_SCRATCH}/duet-${batchId}.tar.gz`,
+    `rm -f ${YOTE_SCRATCH}/duet-${batchId}-chunk-*`,
     `mkdir -p ${remoteRoot}.duet-incoming`,
-    `tar -xzf /tmp/duet-${batchId}.tar.gz -C ${remoteRoot}.duet-incoming`,
+    `tar -xzf ${YOTE_SCRATCH}/duet-${batchId}.tar.gz -C ${remoteRoot}.duet-incoming`,
     `cd ${remoteRoot}.duet-incoming && find . -type f -print0 | while IFS= read -r -d '' f; do dest="${remoteRoot}/$f"; mkdir -p "$(dirname "$dest")"; mv "$f" "$dest"; done`,
-    `rm -rf ${remoteRoot}.duet-incoming /tmp/duet-${batchId}.tar.gz`,
+    `rm -rf ${remoteRoot}.duet-incoming ${YOTE_SCRATCH}/duet-${batchId}.tar.gz`,
     `echo OK`,
   ].join(" && ");
 
@@ -118,7 +126,11 @@ export async function pushBatch(
   return result.ok && result.stdout.includes("OK");
 }
 
-/** Pull a batch of files from yote. Returns map of relPath -> content. */
+/** Pull a batch of files from yote. Returns map of relPath -> content.
+ *  Chunked: the exec path truncates stdout at ~200KB, so a tarball that
+ *  base64s larger than that never arrives whole. We split the base64
+ *  into 60KB chunks on yote and fetch them one at a time, then reassemble
+ *  locally. All temp artifacts (local + remote) are removed in `finally`. */
 export async function pullBatch(
   remoteRoot: string,
   relPaths: string[]
@@ -126,25 +138,44 @@ export async function pullBatch(
   if (relPaths.length === 0) return new Map();
 
   const files = relPaths.map(p => `"${p.replace(/"/g, '\\"')}"`).join(" ");
-  const remoteTar = `/tmp/duet-pull-${Date.now()}.tar.gz`;
+  const batchId = Date.now();
+  const CHUNK = 60000; // base64 chars per chunk — well under the ~200KB stdout cap
+  const SUFFIX_LEN = 3; // split -a 3: supports up to 1000 chunks (~60MB tarball)
 
-  const cmd = [
-    `tar -czf ${remoteTar} -C ${remoteRoot} ${files} 2>/dev/null`,
-    `base64 -w0 ${remoteTar}`,
-    `rm -f ${remoteTar}`,
+  // 1. Tar + base64 + split into numeric-suffixed chunks on yote. Prints chunk count.
+  const prepCmd = [
+    `mkdir -p ${YOTE_SCRATCH}`,
+    `tar -czf ${YOTE_SCRATCH}/duet-pull-${batchId}.tar.gz -C ${remoteRoot} ${files} 2>/dev/null`,
+    `base64 -w0 ${YOTE_SCRATCH}/duet-pull-${batchId}.tar.gz | split -b ${CHUNK} -d -a ${SUFFIX_LEN} - ${YOTE_SCRATCH}/duet-pull-${batchId}-chunk-`,
+    `rm -f ${YOTE_SCRATCH}/duet-pull-${batchId}.tar.gz`,
+    `ls ${YOTE_SCRATCH}/duet-pull-${batchId}-chunk-* 2>/dev/null | wc -l`,
   ].join(" && ");
 
-  const r = await yoteExec(cmd, 60000);
-  if (!r.ok || !r.stdout) return null;
+  const cleanupRemote = () =>
+    yoteExec(`rm -f ${YOTE_SCRATCH}/duet-pull-${batchId}.tar.gz ${YOTE_SCRATCH}/duet-pull-${batchId}-chunk-*`);
 
+  const prep = await yoteExec(prepCmd, 60000);
+  const nChunks = parseInt((prep.stdout || "").trim(), 10);
+  if (!prep.ok || !nChunks || nChunks <= 0) {
+    await cleanupRemote();
+    return null;
+  }
+
+  const localTmp = join(SCRATCH_DIR, `duet-pull-${batchId}.tar.gz`);
+  const extractDir = join(SCRATCH_DIR, `duet-extract-${batchId}`);
   try {
-    const tarData = Buffer.from(r.stdout.trim(), "base64");
-    const localTmp = join(tmpdir(), `duet-pull-${Date.now()}.tar.gz`);
+    // 2. Fetch each chunk (each small, under the stdout cap) and reassemble.
+    let b64 = "";
+    for (let i = 0; i < nChunks; i++) {
+      const suffix = String(i).padStart(SUFFIX_LEN, "0");
+      const r = await yoteExec(`cat ${YOTE_SCRATCH}/duet-pull-${batchId}-chunk-${suffix}`, 30000);
+      if (!r.ok || !r.stdout) return null;
+      b64 += r.stdout.trim();
+    }
+    const tarData = Buffer.from(b64, "base64");
     writeFileSync(localTmp, tarData);
-    // Extract to memory via tar listing
+    // Extract to a temp dir, then read the requested files
     const result = new Map<string, Buffer>();
-    // Use tar to extract to a temp dir, then read
-    const extractDir = join(tmpdir(), `duet-extract-${Date.now()}`);
     await $`mkdir -p ${extractDir} && tar -xzf ${localTmp} -C ${extractDir}`.quiet();
     for (const rel of relPaths) {
       const fp = join(extractDir, rel);
@@ -152,16 +183,20 @@ export async function pullBatch(
         result.set(rel, readFileSync(fp));
       }
     }
-    await $`rm -rf ${localTmp} ${extractDir}`.quiet();
     return result;
   } catch {
     return null;
+  } finally {
+    try {
+      await $`rm -rf ${localTmp} ${extractDir}`.quiet();
+    } catch { /* best effort */ }
+    await cleanupRemote();
   }
 }
 
 /** Fetch the yote manifest (path -> {hash, mtime, size}). */
 export async function fetchManifest(remoteRoot: string): Promise<Record<string, any> | null> {
-  const manifestPath = "/tmp/duet-manifest.json";
+  const manifestPath = `${YOTE_SCRATCH}/duet-manifest.json`;
   const r = await yoteExec(`cat ${manifestPath} 2>/dev/null || echo "{}"`);
   if (!r.ok) return null;
   try {

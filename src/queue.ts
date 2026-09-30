@@ -11,6 +11,8 @@ export interface QueuedBatch {
   direction: "push" | "pull";
   paths: string[];
   attempts: number;
+  /** Epoch ms before which this batch must not be retried (backoff). */
+  nextAttempt?: number;
 }
 
 export class FailoverQueue {
@@ -55,9 +57,13 @@ export class FailoverQueue {
     return id;
   }
 
-  /** Get next pending batch (oldest first). */
+  /** Get next pending batch (oldest first), skipping batches in backoff cooldown. */
   peek(): QueuedBatch | null {
-    return this.queue[0] ?? null;
+    const now = Date.now();
+    for (const q of this.queue) {
+      if (!q.nextAttempt || q.nextAttempt <= now) return q;
+    }
+    return null;
   }
 
   /** Mark batch complete and remove. */
@@ -69,11 +75,14 @@ export class FailoverQueue {
     }
   }
 
-  /** Increment attempt counter (for backoff). */
+  /** Increment attempt counter and set exponential backoff (for backoff). */
   bump(id: string) {
     const q = this.queue.find(q => q.id === id);
     if (q) {
       q.attempts++;
+      // 10s, 20s, 40s ... capped at 5min. Hot-looping a doomed batch
+      // filled /tmp with retry junk (2026-09-30) — never again.
+      q.nextAttempt = Date.now() + Math.min(10000 * 2 ** (q.attempts - 1), 300000);
       this.persist();
     }
   }
@@ -90,16 +99,21 @@ export class FailoverQueue {
       if (!byDir.has(q.direction)) byDir.set(q.direction, new Set());
       for (const p of q.paths) byDir.get(q.direction)!.add(p);
     }
-    // Rebuild queue with merged batches (keep oldest ts per direction)
+    // Rebuild queue with merged batches (keep oldest ts/id per direction,
+    // but preserve the harshest retry state — a merge must never resurrect
+    // a backed-off batch into a hot loop).
     const merged: QueuedBatch[] = [];
     for (const [dir, paths] of byDir) {
-      const oldest = this.queue.find(q => q.direction === dir)!;
+      const group = this.queue.filter(q => q.direction === dir);
+      const oldest = group.reduce((a, b) => (a.ts <= b.ts ? a : b));
+      const nextAttempt = group.reduce((m, q) => Math.max(m, q.nextAttempt ?? 0), 0) || undefined;
       merged.push({
         id: oldest.id,
         ts: oldest.ts,
         direction: dir as "push" | "pull",
         paths: [...paths],
-        attempts: oldest.attempts,
+        attempts: Math.max(...group.map(g => g.attempts)),
+        nextAttempt,
       });
     }
     if (merged.length !== this.queue.length) {

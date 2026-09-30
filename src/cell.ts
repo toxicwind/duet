@@ -7,8 +7,9 @@ import { DebouncedWatcher } from "./watcher";
 import { FailoverQueue } from "./queue";
 import { buildManifest, planSync, defaultIgnore, type Manifest } from "./sync";
 import { yoteExec, pushBatch, pullBatch, fetchManifest } from "./transport";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, statSync, rmSync } from "fs";
 import { join } from "path";
+import { tmpdir } from "os";
 
 const CELL_ROOT = `${process.env.HOME}/workspace/skills`;
 const YOTE_ROOT = "/home/toxic/sovereign/skills";
@@ -16,7 +17,11 @@ const STATE_DIR = `${process.env.HOME}/.duet`;
 const BASELINE_PATH = join(STATE_DIR, "baseline.json");
 const QUEUE_PATH = join(STATE_DIR, "queue.jsonl");
 const CACHE_PATH = join(STATE_DIR, "hashcache.json");
+const QUARANTINE_PATH = join(STATE_DIR, "quarantine.jsonl");
+const SCRATCH_DIR = join(STATE_DIR, "scratch");
 const MANIFEST_INTERVAL_MS = 10000; // poll yote manifest (cell can't receive push)
+const MAX_ATTEMPTS = 20; // then quarantine — a batch that can't succeed must never spin forever
+const STALE_MS = 30 * 60 * 1000; // scratch older than this gets swept
 
 function loadBaseline(): Manifest {
   try {
@@ -36,9 +41,52 @@ function saveBaseline(m: Manifest) {
   } catch {}
 }
 
+// Watchdog: sweep stale duet scratch so no retry loop can ever fill a disk
+// again. Covers the cell staging dir, legacy /tmp junk from the pre-scratch
+// build, atomic-write leftovers in the skills tree, and yote-side staging.
+// Runs at boot and every 5 minutes. (Chris 2026-09-30: the /tmp fill broke all.)
+async function sweepStaleScratch(reason: string) {
+  const now = Date.now();
+  let removed = 0;
+  const rmOld = (dir: string, pattern: RegExp) => {
+    let entries: string[] = [];
+    try { entries = readdirSync(dir); } catch { return; }
+    for (const e of entries) {
+      if (!pattern.test(e)) continue;
+      const p = join(dir, e);
+      try {
+        if (now - statSync(p).mtimeMs > STALE_MS) { rmSync(p, { recursive: true, force: true }); removed++; }
+      } catch { /* best effort */ }
+    }
+  };
+  rmOld(SCRATCH_DIR, /^duet-(push|pull|extract)-/);
+  rmOld(tmpdir(), /^duet-(push|pull|extract)-/); // legacy: the old build leaked these into /tmp
+  // atomic-write leftovers (*.duet-tmp-<pid>) orphaned by killed daemons
+  const walkLeftovers = (dir: string) => {
+    let names: string[];
+    try { names = readdirSync(dir); } catch { return; }
+    for (const n of names) {
+      const p = join(dir, n);
+      let st;
+      try { st = statSync(p); } catch { continue; }
+      if (st.isDirectory()) { walkLeftovers(p); continue; }
+      if (n.includes(".duet-tmp-") && now - st.mtimeMs > STALE_MS) {
+        try { rmSync(p, { force: true }); removed++; } catch { /* best effort */ }
+      }
+    }
+  };
+  walkLeftovers(CELL_ROOT);
+  // yote side — never touches the manifest
+  try {
+    await yoteExec(`find /home/toxic/.duet-scratch -maxdepth 1 \\( -name 'duet-pull-*' -o -name 'duet-push-*' -o -name 'duet-*-chunk-*' \\) -mmin +30 -delete`);
+  } catch { /* bridge may be down; local sweep already done */ }
+  if (removed > 0 || reason === "boot") console.log(`[duet-cell] scratch sweep (${reason}): removed ${removed} stale entries`);
+}
+
 async function main() {
   const once = process.argv.includes("--once");
   mkdirSync(STATE_DIR, { recursive: true });
+  await sweepStaleScratch("boot");
 
   const hasher = new HashCache(CACHE_PATH);
   const queue = new FailoverQueue(QUEUE_PATH);
@@ -51,6 +99,18 @@ async function main() {
     queue.coalesce();
     let batch = queue.peek();
     while (batch) {
+      if (batch.attempts >= MAX_ATTEMPTS) {
+        // Poisoned batch: it will never succeed (files deleted on the far
+        // side, permanent transport mismatch, ...). Quarantine it LOUDLY and
+        // move on — never spin forever, never block the rest of the queue.
+        try {
+          appendFileSync(QUARANTINE_PATH, JSON.stringify({ ...batch, quarantinedAt: Date.now(), reason: `failed ${batch.attempts} attempts` }) + "\n");
+        } catch { /* best effort */ }
+        console.log(`[duet-cell] QUARANTINED ${batch.direction} batch ${batch.id} after ${batch.attempts} attempts (${batch.paths.length} files) — see quarantine.jsonl`);
+        queue.ack(batch.id);
+        batch = queue.peek();
+        continue;
+      }
       console.log(`[duet-cell] draining ${batch.direction} batch ${batch.id} (${batch.paths.length} files, attempt ${batch.attempts})`);
       let ok = false;
       if (batch.direction === "push") {
@@ -75,8 +135,9 @@ async function main() {
         console.log(`[duet-cell] batch ${batch.id} OK`);
       } else {
         queue.bump(batch.id);
-        console.log(`[duet-cell] batch ${batch.id} FAILED (bridge down?), will retry`);
-        return false; // stop draining, bridge is down
+        const next = queue.peek() === batch ? "now" : `in backoff`;
+        console.log(`[duet-cell] batch ${batch.id} FAILED (attempt ${batch.attempts}), retry ${next}`);
+        return false; // stop draining, bridge is down or batch is poisoned
       }
       batch = queue.peek();
     }
@@ -194,6 +255,10 @@ async function main() {
     }
   }, MANIFEST_INTERVAL_MS);
   console.log(`[duet-cell] polling yote manifest every ${MANIFEST_INTERVAL_MS}ms`);
+
+  // Scratch watchdog — auto-delete stale temp artifacts, both sides.
+  setInterval(() => { sweepStaleScratch("periodic").catch(() => {}); }, 5 * 60 * 1000);
+  console.log("[duet-cell] scratch watchdog sweeping every 5m");
 
   // Graceful shutdown
   process.on("SIGINT", () => { watcher.stop(); hasher.save(); process.exit(0); });
