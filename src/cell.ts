@@ -78,7 +78,7 @@ async function sweepStaleScratch(reason: string) {
   walkLeftovers(CELL_ROOT);
   // yote side — never touches the manifest
   try {
-    await yoteExec(`find /home/toxic/.duet-scratch -maxdepth 1 \\( -name 'duet-pull-*' -o -name 'duet-push-*' -o -name 'duet-*-chunk-*' \\) -mmin +30 -delete`);
+    await yoteExec(`find /home/toxic/.duet-scratch -maxdepth 1 \\( -name 'duet-pull-*' -o -name 'duet-push-*' -o -name 'duet-*-chunk-*' -o -name 'duet-*.tar.gz' \\) -mmin +30 -delete`);
   } catch { /* bridge may be down; local sweep already done */ }
   if (removed > 0 || reason === "boot") console.log(`[duet-cell] scratch sweep (${reason}): removed ${removed} stale entries`);
 }
