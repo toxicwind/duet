@@ -2,13 +2,13 @@
 #
 # synx installation script — universal Linux / macOS installer.
 # Usage:
-#     curl -fsSL https://raw.githubusercontent.com/Muvon/synx/master/install.sh | sh
-#     curl -fsSL https://raw.githubusercontent.com/Muvon/synx/master/install.sh | sh -s -- --version 0.1.0
+#     curl -fsSL https://raw.githubusercontent.com/toxicwind/duet/master/install.sh | sh
+#     curl -fsSL https://raw.githubusercontent.com/toxicwind/duet/master/install.sh | sh -s -- --version 0.1.0
 #
 
 set -eu
 
-REPO="Muvon/synx"
+REPO="toxicwind/duet"
 BINARY_NAME="synx"
 INSTALL_DIR="${SYNX_INSTALL_DIR:-$HOME/.local/bin}"
 
@@ -152,8 +152,8 @@ SUPPORTED TARGETS:
     aarch64-apple-darwin
 
 EXAMPLES:
-    curl -fsSL https://raw.githubusercontent.com/Muvon/synx/master/install.sh | sh
-    curl -fsSL https://raw.githubusercontent.com/Muvon/synx/master/install.sh | sh -s -- --version 0.1.0
+    curl -fsSL https://raw.githubusercontent.com/toxicwind/duet/master/install.sh | sh
+    curl -fsSL https://raw.githubusercontent.com/toxicwind/duet/master/install.sh | sh -s -- --version 0.1.0
     SYNX_INSTALL_DIR=/usr/local/bin curl -fsSL .../install.sh | sh
 EOF
 }
