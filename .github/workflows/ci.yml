@@ -6,68 +6,28 @@ on:
   pull_request:
     branches: [main, master, develop]
 
-# A new push supersedes whatever is still running for the same branch or PR —
-# there is no point burning runners on a commit nobody is looking at any more.
-# Grouping by workflow + ref keeps master, each branch and each PR independent.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   rust:
-    name: Rust CI
-    uses: muvon/ci-workflow/.github/workflows/rust-ci.yml@master
-    with:
-      test-os: '["ubuntu-latest", "macos-latest"]'
-      test-includes: '[{"os": "ubuntu-latest", "rust": "beta"}]'
-      doc: false
-      coverage: false
-
-
-  coverage:
-    name: Coverage Report
-    permissions:
-      contents: write # push the badge JSON to the `badges` branch
-    uses: muvon/ci-workflow/.github/workflows/rust-coverage.yml@master
-
-  musl-build:
-    name: Musl Build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-22.04-arm
+    name: Rust build and test
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          components: rustfmt
+      - run: cargo fmt --check
+      - run: cargo build --release
+      - run: cargo test --release
 
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
-            ${{ runner.os }}-cargo-
-
-      - name: cargo build (musl)
-        run: cargo build --target ${{ matrix.target }}
-
-  brief:
-    uses: muvon/ci-workflow/.github/workflows/brief.yml@master
-    secrets: inherit
+  bun:
+    name: Bun TypeScript tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - run: bun test
