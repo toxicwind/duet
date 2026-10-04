@@ -110,15 +110,15 @@ export async function pushBatch(
     return false;
   }
 
-  // Concatenate, decode, extract atomically — single exec
-  // Note: while-loop body uses ; not && (do && is a syntax error)
+  // Concatenate, decode, extract directly to remoteRoot — single exec, single tar.
+  // (2026-10-03: the old staging + per-file mv loop spawned ~3 procs/file, took
+  // minutes per batch, and the yote manifest never converged -> infinite re-push.)
   const applyCmd = [
     `cat ${YOTE_SCRATCH}/duet-${batchId}-chunk-* | base64 -d > ${YOTE_SCRATCH}/duet-${batchId}.tar.gz`,
     `rm -f ${YOTE_SCRATCH}/duet-${batchId}-chunk-*`,
-    `mkdir -p ${remoteRoot}.duet-incoming`,
-    `tar --no-same-owner -xzf ${YOTE_SCRATCH}/duet-${batchId}.tar.gz -C ${remoteRoot}.duet-incoming`,
-    `cd ${remoteRoot}.duet-incoming && find . -type f -print0 | while IFS= read -r -d '' f; do dest="${remoteRoot}/$f"; mkdir -p "$(dirname "$dest")"; mv "$f" "$dest"; done`,
-    `rm -rf ${remoteRoot}.duet-incoming ${YOTE_SCRATCH}/duet-${batchId}.tar.gz`,
+    `mkdir -p ${remoteRoot}`,
+    `tar --no-same-owner -xzf ${YOTE_SCRATCH}/duet-${batchId}.tar.gz -C ${remoteRoot}`,
+    `rm -f ${YOTE_SCRATCH}/duet-${batchId}.tar.gz`,
     `echo OK`,
   ].join(" && ");
 
