@@ -19,7 +19,7 @@ const QUEUE_PATH = join(STATE_DIR, "queue.jsonl");
 const CACHE_PATH = join(STATE_DIR, "hashcache.json");
 const QUARANTINE_PATH = join(STATE_DIR, "quarantine.jsonl");
 const SCRATCH_DIR = join(STATE_DIR, "scratch");
-const MANIFEST_INTERVAL_MS = 10000; // poll yote manifest (cell can't receive push)
+const MANIFEST_INTERVAL_MS = 60000; // poll yote manifest (cell can't receive push)
 const MAX_ATTEMPTS = 20; // then quarantine — a batch that can't succeed must never spin forever
 const STALE_MS = 30 * 60 * 1000; // scratch older than this gets swept
 
